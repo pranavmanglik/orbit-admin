@@ -19,18 +19,21 @@ import html
 import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import asdict
+from math import ceil
 
 from orbit.application import Application
 from orbit.application import ApplicationSummary as AdminOverview
 from orbit.asgi.request import Headers, HTTPError, Request
 from orbit.asgi.response import Response
 from orbit.diagnostics import inspect_composition
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_security import RateLimiter
 from pydantic import BaseModel
 
 from orbit_admin.audit import AdminAuditLog, AdminAuditRecord, AdminAuditSink
+from orbit_admin.http_security import has_explicit_non_browser_authorization
 
 _LOG = logging.getLogger(__name__)
 _ADMIN_TARGET_NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
@@ -70,14 +73,6 @@ class AdminApplication:
             service_names=tuple(d.name for d in self._application.services.descriptors),
         )
 
-    @staticmethod
-    def _has_explicit_authorization(request: Request) -> bool:
-        """Require one nonempty authorization field and no browser Origin for mutations."""
-        if not isinstance(request.headers, Headers):
-            raise TypeError("Admin mutations require Core Headers.")
-        values = request.headers.getall("authorization")
-        return len(values) == 1 and bool(values[0].strip()) and not request.headers.getall("origin")
-
     async def _audit_records(self) -> tuple[AdminAuditRecord, ...]:
         """Return an optional bounded audit view when the injected sink supports reads."""
         recent = getattr(self._audit_log, "recent", None)
@@ -104,13 +99,13 @@ class AdminApplication:
             return Response(
                 response.status,
                 response.body,
-                {**response.headers, "retry-after": str(max(1, int(decision.retry_after + 0.999)))},
+                {**response.headers, "retry-after": str(max(1, ceil(decision.retry_after)))},
             )
         overview = await self.overview()
         service_prefix = "/admin/services/"
         task_prefix = "/admin/tasks/"
         if request.method == "POST" and request.path.startswith(task_prefix):
-            if not self._has_explicit_authorization(request):
+            if not has_explicit_non_browser_authorization(request):
                 raise HTTPError(
                     403, "security.csrf", "Explicit non-browser authorization required."
                 )
@@ -138,7 +133,7 @@ class AdminApplication:
             await self._audit_log.record("task.restart", target=name, success=True)
             return Response.json({"status": "restarted", "task": name})
         if request.method == "POST" and request.path.startswith(service_prefix):
-            if not self._has_explicit_authorization(request):
+            if not has_explicit_non_browser_authorization(request):
                 raise HTTPError(
                     403, "security.csrf", "Explicit non-browser authorization required."
                 )
@@ -181,7 +176,7 @@ class AdminApplication:
         if request.method == "POST" and request.path == "/admin/health/refresh":
             # No ambient cookie-only authority for mutations. Browsers with a hostile Origin
             # are rejected even when a custom authenticator also accepts cookies.
-            if not self._has_explicit_authorization(request):
+            if not has_explicit_non_browser_authorization(request):
                 raise HTTPError(
                     403, "security.csrf", "Explicit non-browser authorization required."
                 )
@@ -333,6 +328,17 @@ class AdminOperationsPlugin(Plugin):
             raise TypeError("audit_log must implement AdminAuditSink.")
         self._rate_limit = rate_limit
         self._rate_period = float(rate_period)
+        self._console: AdminApplication | None = None
+        self.control_actions = (
+            ControlAction(
+                id="review-operations-overview",
+                title="Review Admin operations overview",
+                description=(
+                    "Show local application and service counts without making HTTP requests."
+                ),
+                handler=self._review_overview,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Register exact Admin routes with deny-by-default Core role metadata."""
@@ -344,6 +350,7 @@ class AdminOperationsPlugin(Plugin):
             rate_limit=self._rate_limit,
             rate_period=self._rate_period,
         )
+        self._console = console
         read_paths = (
             "/admin",
             "/admin/",
@@ -379,6 +386,7 @@ class AdminOperationsPlugin(Plugin):
             ("/admin/tasks/{name}/restart", "admin-operations-task-restart"),
             ("/admin/services/{name}/{action}", "admin-operations-service-action"),
         )
+
         for path, name in writes:
 
             async def write_operation(
@@ -392,6 +400,19 @@ class AdminOperationsPlugin(Plugin):
                 name=name,
                 roles=frozenset({"orbit.admin.write"}),
             )(write_operation)
+
+    async def _review_overview(self, _: Mapping[str, object]) -> ControlResult:
+        """Read the same bounded application summary used by the protected Admin overview."""
+        if self._console is None:
+            return ControlResult("Admin operations plugin is not configured.", succeeded=False)
+        overview = await self._console.overview()
+        return ControlResult(
+            "Admin operations overview is ready.",
+            (
+                f"application_state: {overview.state}",
+                f"registered_services: {len(overview.service_names)}",
+            ),
+        )
 
 
 __all__ = ["AdminOperationsPlugin"]

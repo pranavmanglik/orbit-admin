@@ -14,21 +14,29 @@
 """Python Admin capability plugin for Orbit Core applications."""
 
 from orbit_admin.audit import AdminAuditLog, AdminAuditRecord, AdminAuditSink, SQLAdminAuditLog
+from orbit_admin.audit_delta import AdminDeltaAuditSink, EncryptedObjectDeltaAuditSink
 from orbit_admin.client import AdminClient, AdminClientError, AdminHTTPResponse, AdminTransport
+from orbit_admin.csrf import AdminCSRFProtector
+from orbit_admin.errors import AdminAuditPersistenceError
 from orbit_admin.operations import AdminOperationsPlugin
 from orbit_admin.plugin import AdminPlugin
-from orbit_admin.resources import AdminResource, sql_resource
+from orbit_admin.resources import AdminMutationSnapshot, AdminResource, sql_resource
 
 __all__ = [
     "AdminAuditLog",
     "AdminAuditRecord",
     "AdminAuditSink",
+    "AdminAuditPersistenceError",
+    "AdminDeltaAuditSink",
+    "EncryptedObjectDeltaAuditSink",
     "AdminClient",
     "AdminClientError",
+    "AdminCSRFProtector",
     "AdminHTTPResponse",
     "AdminTransport",
     "AdminPlugin",
     "AdminOperationsPlugin",
+    "AdminMutationSnapshot",
     "AdminResource",
     "SQLAdminAuditLog",
     "sql_resource",

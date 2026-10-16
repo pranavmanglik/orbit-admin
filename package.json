@@ -1,7 +1,7 @@
 {
   "name": "@orbit-projects/orbit-admin",
   "version": "0.1.0-alpha.1",
-  "description": "Read-only TypeScript operations dashboard for Orbit Core Admin APIs.",
+  "description": "Orbit Admin operations dashboard with opt-in resource CRUD.",
   "license": "Apache-2.0",
   "type": "module",
   "sideEffects": false,
@@ -15,6 +15,6 @@
     "typescript": "~5.9.3"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

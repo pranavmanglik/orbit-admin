@@ -2,9 +2,10 @@
 
 ## Responsibility
 
-`@orbit-projects/orbit-admin` is a small TypeScript operations dashboard for the authenticated,
-read-only inspection APIs already provided by Orbit Core. The browser package is installed and
-deployed separately; it does not add routes, credentials, dependencies, or a UI framework to Core.
+`@orbit-projects/orbit-admin` provides a TypeScript dashboard for Orbit operations and explicitly
+configured business resources, plus an optional Python plugin that registers the matching APIs. The
+browser package is installed and deployed separately; it does not add routes, credentials,
+dependencies, or a UI framework to Core.
 
 ## Declared dependencies
 
@@ -12,6 +13,7 @@ The following dependency declarations come from the checked-in manifests. Option
 
 ### `python/pyproject.toml`
 - `orbit-core>=0.1.0a1,<0.2`
+- `orbit-auth>=0.1.0a1,<0.2`
 - `orbit-security>=0.1.0a1,<0.2`
 - `orbit-data>=0.1.0a1,<0.2`
 - `orbit-sql>=0.1.0a1,<0.2`
@@ -36,29 +38,50 @@ Representative implementation files in this checkout:
 - `src/admin-client.ts`
 - `src/main.ts`
 
-## Public contract and scope
-
 ## Current scope
 
 The dashboard provides application state, services, tasks, plugins, routes, dependencies,
-configuration, lifecycle, health, diagnostics, events, and administrative audit views. It is
-read-only. Core deliberately rejects browser-originated operational mutations unless a client
-provides explicit non-browser authorization, so the UI does not expose service controls. It is not
-a business-data CRUD framework, analytics warehouse, identity manager, or replacement for Core's
-server-rendered Admin fallback. Those capabilities need separate resource, authorization, audit,
-and data-exposure contracts before implementation.
+configuration, lifecycle, health, diagnostics, events, and administrative audit views. It also
+lists configured Python resources and displays a bounded first page using the fields serialized by
+the server. When browser writes are explicitly enabled, it offers create, update, and delete forms
+using the Python plugin's write-field allowlists and identity-bound CSRF tokens. It does not expose
+Core operational controls. It is not an analytics warehouse, identity manager, or replacement for
+Core's server-rendered Admin fallback.
 
 This repository provides two independent packages: the TypeScript dashboard at the root and an
-optional Python plugin in `python/`. The Python package adds explicitly configured repository CRUD
-routes and depends directly on Core, `orbit-security`, `orbit-data`, and `orbit-sql`. Core still owns
-the transitional `/admin` operations API and authentication internals; their extraction remains
-open under ADR 0022. The Python package does not start a separate process or add a web framework,
-and supports an opt-in SQL audit sink with bounded retention.
+optional Python plugin in `python/`. The Python package depends directly on Core, `orbit-auth`,
+`orbit-auth-rbac`, `orbit-security`, `orbit-data`, and `orbit-sql`; it adds explicitly configured
+repository CRUD routes, field-level RBAC filtering, and an optional SQL audit sink. It does not
+start a separate process or add a web framework.
+Core still owns the transitional `/admin` operations API and authentication internals; their
+extraction remains open under ADR 0022.
 
-Both packages are pre-alpha and have not been published. The Python CRUD package has local SQLite
-coverage for its SQL audit sink but no live SQL provider matrix or production load evidence. Browser compatibility,
-reverse-proxy behavior, and production authentication have not been exercised in this checkpoint.
+Both packages are unpublished v0.1.0-alpha review candidates. The Python package passes 64 local
+tests per CPython 3.11–3.14 version, plus lint, formatting, strict type checks, package builds, and
+dependency audit. It has local SQLite coverage for its SQL audit sink, but no live SQL provider matrix
+or production load evidence. Browser compatibility, reverse-proxy behavior, and production
+authentication have not been exercised in this checkpoint.
 
-## Boundary rules
+## Request and dependency boundaries
 
-Keep provider SDKs, credentials, transports, and provider-specific error translation in provider adapters. Keep reusable capability contracts in the matching capability package and lifecycle orchestration in Core. Apply the relevant layer for this repository and preserve the dependency direction shown above.
+The browser package calls Core's existing authenticated operations routes using same-origin GET
+requests. It does not register routes or expose operational mutations. The Python plugin registers
+Core routes carrying `orbit.admin.read` or `orbit.admin.write` role requirements; the host supplies
+the authenticator and route authorizer. Non-browser writes require explicit Authorization. Browser
+CRUD writes are opt-in through an identity-bound CSRF token and are rejected if no CSRF secret is
+configured.
+
+For CRUD, the application explicitly composes `AdminResource` values over `orbit-data.Repository`
+implementations. `sql_resource` is a convenience over `orbit-sql.SQLDatabase`; the SQL provider
+remains a separate package and owns its connection lifecycle. `SQLAdminAuditLog` uses that same
+application-owned database resource but does not own or close it. Audit persistence and resource
+mutation are not atomic as a unit.
+
+`AdminResource.read_fields` is the outer exposure allowlist. Optional `field_permissions` require an
+`orbit-auth-rbac.PermissionAuthorizer`; denied fields are omitted before Pydantic response
+serialization. `authorization_context_fields` selects server-loaded model fields passed as resource
+attributes for tenant/row policies. Those values never come from the write or query request.
+
+Keep the static dashboard, route plugin, auth/role contracts, repository interfaces, SQL provider,
+and application composition at these package boundaries. Do not infer a durable audit ledger,
+database-driver integration, or identity provider from the Admin package itself.

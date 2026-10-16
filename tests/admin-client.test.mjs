@@ -82,3 +82,99 @@ test("API path and byte limit cannot point to another origin or exceed the fixed
   assert.throws(() => createAdminClient(fetch, "/admin%2f.."), TypeError);
   assert.throws(() => createAdminClient(fetch, "/admin", 16_777_217), RangeError);
 });
+
+test("resource browser reads a validated catalog and a bounded first page", async () => {
+  const requests = [];
+  const client = createAdminClient(async (url, options) => {
+    requests.push([url, options]);
+    if (url === "/admin-api/v1/resources") {
+      return Response.json({ items: [{ name: "accounts", read_fields: ["display_name", "id"] }] });
+    }
+    return Response.json({ items: [{ display_name: "Ada", id: 1 }] });
+  });
+
+  assert.deepEqual(await client.listResources(), [
+    { name: "accounts", read_fields: ["display_name", "id"] },
+  ]);
+  assert.deepEqual(await client.readResource("accounts"), [{ display_name: "Ada", id: 1 }]);
+  assert.deepEqual(requests.map(([url]) => url), [
+    "/admin-api/v1/resources",
+    "/admin-api/v1/resources/accounts?limit=100",
+  ]);
+  for (const [, options] of requests) {
+    assert.equal(options.credentials, "same-origin");
+    assert.equal(options.cache, "no-store");
+    assert.equal(options.redirect, "error");
+  }
+});
+
+test("resource names and catalog field metadata are validated before use", async () => {
+  let requests = 0;
+  const invalidPathClient = createAdminClient(async () => {
+    requests += 1;
+    return Response.json({ items: [] });
+  });
+  await assert.rejects(invalidPathClient.readResource("../accounts"), TypeError);
+  assert.equal(requests, 0);
+
+  const invalidCatalogClient = createAdminClient(async () => Response.json({
+    items: [{ name: "accounts", read_fields: ["<script>"] }],
+  }));
+  await assert.rejects(invalidCatalogClient.listResources(), { code: "admin.invalid-response" });
+});
+
+test("resource writes require a CSRF token and the declared field allowlist", async () => {
+  const requests = [];
+  const csrf = `v1.${"a".repeat(100)}`;
+  const client = createAdminClient(async (url, options) => {
+    requests.push([url, options]);
+    if (url.endsWith("/write-capabilities")) {
+      return Response.json({ items: [{
+        name: "accounts",
+        key_field: "id",
+        create_fields: ["display_name"],
+        update_fields: ["display_name"],
+        allow_delete: true,
+      }] });
+    }
+    if (url.endsWith("/csrf-token")) return Response.json({ token: csrf });
+    if (options.method === "DELETE") return new Response(null, { status: 204 });
+    return Response.json({ item: { display_name: "Ada" } });
+  });
+
+  const [capability] = await client.listWriteCapabilities();
+  assert.equal(capability.name, "accounts");
+  const token = await client.csrfToken();
+  await client.createResource("accounts", capability.create_fields, token, { display_name: "Ada" });
+  await client.updateResource("accounts", 7, capability.update_fields, token, { display_name: "Ada" });
+  await client.deleteResource("accounts", 7, token);
+  assert.deepEqual(requests.map(([url, options]) => [url, options.method]), [
+    ["/admin-api/v1/write-capabilities", "GET"],
+    ["/admin-api/v1/csrf-token", "GET"],
+    ["/admin-api/v1/resources/accounts", "POST"],
+    ["/admin-api/v1/resources/accounts/7", "PUT"],
+    ["/admin-api/v1/resources/accounts/7", "DELETE"],
+  ]);
+  assert.equal(requests[2][1].headers["x-orbit-csrf-token"], csrf);
+  assert.equal(requests[2][1].credentials, "same-origin");
+  assert.equal(requests[2][1].cache, "no-store");
+  await assert.rejects(
+    client.createResource("accounts", capability.create_fields, token, { password_hash: "blocked" }),
+    TypeError,
+  );
+  await assert.rejects(client.deleteResource("accounts", "../7", token), TypeError);
+
+  const ambiguousOutcome = createAdminClient(async () => Response.json(
+    { code: "admin.audit-unavailable", message: "password=never-display" },
+    { status: 503 },
+  ));
+  await assert.rejects(
+    ambiguousOutcome.createResource("accounts", ["display_name"], token, { display_name: "Ada" }),
+    (error) => {
+      assert.ok(error instanceof AdminClientError);
+      assert.match(error.message, /may have completed/);
+      assert.equal(error.message.includes("never-display"), false);
+      return true;
+    },
+  );
+});

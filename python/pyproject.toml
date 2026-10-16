@@ -13,23 +13,31 @@ license-files = ["LICENSE"]
 dependencies = [
   "orbit-core>=0.1.0a1,<0.2",
   "orbit-auth>=0.1.0a1,<0.2",
+  "orbit-auth-rbac>=0.1.0a1,<0.2",
   "orbit-security>=0.1.0a1,<0.2",
   "orbit-data>=0.1.0a1,<0.2",
   "orbit-sql>=0.1.0a1,<0.2",
   "pydantic>=2.8,<3",
 ]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
+encrypted-audit = [
+  "cryptography>=50,<51",
+  "orbit-storage>=0.1.0a1,<0.2",
+]
 dev = [
+  "cryptography>=50,<51",
   "pytest>=8,<10",
   "pytest-asyncio>=0.24,<2",
   "ruff>=0.8,<1",
   "mypy>=1.13,<2",
+  "pip-audit>=2.10,<3",
+  "setuptools>=83.0.0",
   "orbit-testing>=0.1.0a1,<0.2",
   "orbit-sql-sqlite>=0.1.0a1,<0.2",
 ]

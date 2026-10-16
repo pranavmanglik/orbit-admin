@@ -56,6 +56,21 @@ default. There are no built-in users. Do not keep passwords in source code or co
 The static-user mechanism does not supply account recovery, federation, MFA, or session lifecycle;
 production deployments should use a suitable identity provider and secret-rotation process.
 
+Browser-originated CRUD remains disabled unless the plugin receives a random secret of at least
+32 bytes through `AdminPlugin(..., csrf_secret=...)`. The plugin then exposes a role-protected,
+no-store `/admin-api/v1/csrf-token` endpoint; send its short-lived token in
+`X-Orbit-CSRF-Token` for create, update, and delete requests. Load the secret from a secret manager,
+share it across application workers, keep the UI same-origin over HTTPS, and restrict credentialed
+CORS to exact trusted origins. Without this option, ambient cookies and browser `Origin` requests
+cannot mutate resources.
+
+When this option is enabled, the TypeScript dashboard exposes browser CRUD controls only to
+operators who also have `orbit.admin.write`. The protected write-capability route publishes the
+explicit writable fields; the UI requests a fresh CSRF token for each mutation. It uses bounded JSON
+object editors rather than deriving forms from a database schema. Edit and delete controls appear
+only when the configured key field is present in the server-serialized row, so include the key in
+`read_fields` when those controls are needed.
+
 Every resource declares its response and create fields. Fields such as password hashes or internal
 flags stay private unless explicitly included in `read_fields`; writes accept only the declared
 allowlists. Update routes are disabled unless an application supplies an `update_handler` that
@@ -85,6 +100,39 @@ tamper-evident, transactionally coupled ledger need a dedicated audit design. Pr
 table with database permissions and backups. No live MySQL or PostgreSQL audit integration is
 claimed.
 
+### Encrypted state-diff audit
+
+For deployments that need encrypted before/after snapshots, install the `encrypted-audit` extra
+and configure `EncryptedObjectDeltaAuditSink` with an application-owned `orbit-storage` object
+store, a 32-byte AES-256 key, and a stable key identifier. There are no generated or default keys.
+The sink writes each bounded (1 MiB maximum) JSON snapshot as an async stream encrypted with
+AES-256-GCM, using a fresh random nonce and authenticating the operation and resource name. A
+consumer must verify the GCM tag before using any plaintext and must resolve the key identifier
+through its secret manager. Rotate keys by changing the key identifier and retaining authorized
+access to old keys for the required audit retention period; follow the deployment's cryptographic
+policy and rotate well before 2^32 records per key because this sink uses random 96-bit nonces.
+
+Pass the sink as `AdminPlugin(..., delta_audit=sink)`. Each writable `AdminResource` must then
+provide a `delta_mutation_handler` that performs the mutation and returns
+`AdminMutationSnapshot(before=..., after=...)` from the same repository transaction or from a
+provider-specific compare-and-swap operation. The `sql_resource` factory accepts this handler
+through its `delta_mutation_handler` argument, so SQL-backed resources can use the same audited
+mutation contract. This avoids presenting a separate pre-read as the authoritative state changed
+by an update. The operation audit record links to the encrypted object
+through an opaque delta identifier appended to its `target` field. The encrypted object write
+happens after the mutation handler completes, however, so a process crash or storage failure can
+still leave an unrecorded mutation. Use an application-owned transactional outbox to close that
+failure window. The sink
+provides authenticated encryption, not an append-only hash chain; configure object versioning,
+retention lock, least-privilege access, and independent backups when the deployment needs stronger
+tamper resistance. The resource database and object store do not share a transaction.
+
+If the delta sink fails after the mutation handler completes, the route returns
+`503 admin.audit-unavailable` with guidance to verify the resource state before retrying. This
+response does not mean the mutation rolled back. Sink exceptions and provider details are not
+returned to the client; instrument the application boundary to record sanitized operational
+context and alert on audit persistence failures.
+
 ## Operations API and security
 
 `AdminPlugin(resources)` registers both the operations console and CRUD routes. Use
@@ -102,10 +150,13 @@ bounded process-local rate limit (120 requests per 60 seconds by default) and re
 `Retry-After` when full. It is not a distributed quota. Responses are non-cacheable and mutation
 audit records omit credentials, request bodies, entity values, and resource keys.
 
-The package is pre-alpha. Python tests cover operations routes, auth/role enforcement, local rate
-limits, CRUD field allowlists, and SQLite audit persistence. Open release gates include hosted CI,
-live MySQL/PostgreSQL audit verification, atomic CRUD-plus-audit semantics, production browser/auth
-proxy review, durable tamper-evident audit requirements, and the hosted package release process.
-Local tests do not certify production readiness.
+The package is an unpublished v0.1.0-alpha review candidate. Python tests cover operations routes,
+auth/role enforcement, local rate limits, CRUD field allowlists, SQLite audit persistence, and
+encrypted-delta authentication. The local CPython 3.11–3.14 matrix passes 64 tests per version,
+Ruff lint/format, strict mypy, wheel/source builds, and pip-audit. Hosted CI, live MySQL/PostgreSQL
+audit verification, transactional outbox integration for guaranteed audit delivery, production
+browser/auth proxy review, external key management and object-retention validation, production load,
+and the hosted package release process remain open gates. Local checks do not certify production
+readiness.
 
 Licensed under Apache-2.0.

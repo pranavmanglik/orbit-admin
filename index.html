@@ -32,7 +32,10 @@
         <aside class="sidebar" aria-label="Administration sections">
           <p class="eyebrow">OPERATIONS</p>
           <nav id="section-navigation" class="section-navigation"></nav>
-          <p class="sidebar-note">Read-only views from the authenticated Core Admin API.</p>
+          <p class="eyebrow resource-heading">RESOURCES</p>
+          <nav id="resource-navigation" class="section-navigation" aria-label="Business resources"></nav>
+          <p class="resource-empty" id="resource-empty">Loading configured resources.</p>
+          <p class="sidebar-note">Operations are read-only; resource writes are permission and CSRF gated.</p>
         </aside>
 
         <section class="content" aria-labelledby="view-title">
@@ -61,9 +64,10 @@
                 <h2 id="data-title">Application state</h2>
                 <p id="data-caption">Sensitive values are redacted by Core.</p>
               </div>
-              <span class="read-only-tag">READ ONLY</span>
+              <span class="read-only-tag" id="access-mode">READ ONLY</span>
             </div>
             <pre class="json-view" id="data-view" tabindex="0" aria-label="Admin data">{}</pre>
+            <div class="resource-table-view" id="resource-table-view" hidden></div>
           </div>
         </section>
       </main>

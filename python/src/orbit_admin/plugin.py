@@ -15,17 +15,24 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
 
 from orbit import Application
-from orbit.asgi import Request, Response
+from orbit.asgi import Headers, Request, Response
 from orbit.asgi.request import HTTPError
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
+from orbit.security.context import current_principal
+from orbit_auth import Principal
+from orbit_auth_rbac import RoleSubject
 from orbit_data import RepositoryConflictError
 
 from orbit_admin.audit import AdminAuditLog, AdminAuditSink
+from orbit_admin.audit_delta import AdminDeltaAuditSink
+from orbit_admin.csrf import AdminCSRFProtector
+from orbit_admin.http_security import has_explicit_non_browser_authorization
 from orbit_admin.resources import AdminResource
 
 _READ = frozenset({"orbit.admin.read"})
@@ -34,6 +41,7 @@ _MAX_PAGE_SIZE = 100
 _MAX_KEY_CHARS = 255
 _MAX_WRITE_BODY_BYTES = 1_048_576
 _MAX_RESPONSE_BYTES = 2_097_152
+_DELTA_IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 
 
 class AdminPlugin(Plugin):
@@ -42,6 +50,8 @@ class AdminPlugin(Plugin):
     Core passes bounded route-role metadata to the explicitly configured ``RouteAuthorizer`` after
     authentication. No resource is discovered from a database schema or imported implicitly.
     Mutating routes are registered only when their resource enables the corresponding operation.
+    Optional encrypted delta auditing requires an application mutation handler for every writable
+    resource and stores the resulting opaque delta reference in the operation audit record.
     """
 
     metadata = PluginMetadata(
@@ -56,6 +66,9 @@ class AdminPlugin(Plugin):
         *,
         prefix: str = "/admin-api/v1",
         audit_log: AdminAuditSink | None = None,
+        delta_audit: AdminDeltaAuditSink | None = None,
+        csrf_secret: bytes | None = None,
+        csrf_token_ttl_seconds: int = 600,
         operations: bool = True,
     ) -> None:
         """Capture a unique, immutable resource registry and a validated route prefix."""
@@ -82,21 +95,171 @@ class AdminPlugin(Plugin):
         if audit_log is not None and not isinstance(audit_log, AdminAuditSink):
             raise TypeError("audit_log must implement the asynchronous AdminAuditSink contract.")
         self.audit_log: AdminAuditSink = AdminAuditLog() if audit_log is None else audit_log
+        if delta_audit is not None and not isinstance(delta_audit, AdminDeltaAuditSink):
+            raise TypeError("delta_audit must implement the AdminDeltaAuditSink contract.")
+        if delta_audit is not None and any(
+            (resource.create_fields or resource.update_fields or resource.allow_delete)
+            and resource.delta_mutation_handler is None
+            for resource in detached
+        ):
+            raise ValueError(
+                "Encrypted delta auditing requires each writable resource to provide an "
+                "atomic delta_mutation_handler."
+            )
+        self.delta_audit = delta_audit
+        if csrf_secret is None:
+            self._csrf_protector = None
+            if (
+                isinstance(csrf_token_ttl_seconds, bool)
+                or not isinstance(csrf_token_ttl_seconds, int)
+                or csrf_token_ttl_seconds != 600
+            ):
+                raise ValueError("csrf_token_ttl_seconds requires csrf_secret.")
+        else:
+            self._csrf_protector = AdminCSRFProtector(
+                csrf_secret,
+                token_ttl_seconds=csrf_token_ttl_seconds,
+            )
         if not isinstance(operations, bool):
             raise TypeError("operations must be bool.")
         self._operations = operations
+        self._application: Application | None = None
+        actions = [
+            ControlAction(
+                id="review-resource-catalog",
+                title="Review Admin resource catalog",
+                description="Review allowlisted resource counts and endpoint prefix.",
+                handler=self._review_resource_catalog,
+            )
+        ]
+        if operations:
+            actions.append(
+                ControlAction(
+                    id="review-operations-overview",
+                    title="Review Admin operations overview",
+                    description=(
+                        "Show local application and service counts without making HTTP requests."
+                    ),
+                    handler=self._review_operations_overview,
+                )
+            )
+        self.control_actions = tuple(actions)
 
     def setup(self, application: Application) -> None:
         """Register read and explicitly enabled mutation routes during Core composition."""
         if not isinstance(application, Application):
             raise TypeError("AdminPlugin requires an Orbit Application.")
+        self._application = application
         if self._operations:
             from orbit_admin.operations import AdminOperationsPlugin
 
             AdminOperationsPlugin(audit_log=self.audit_log).setup(application)
+        writable_resources = tuple(
+            resource
+            for resource in self._resources.values()
+            if resource.create_fields or resource.update_fields or resource.allow_delete
+        )
+        if self._csrf_protector is not None and writable_resources:
+            self._register_csrf_route(application)
+            self._register_write_capabilities_route(application, writable_resources)
+        self._register_catalog_route(application)
         for resource in self._resources.values():
             self._register_read_routes(application, resource)
             self._register_write_routes(application, resource)
+
+    def _register_catalog_route(self, application: Application) -> None:
+        """Expose only resource names and fields visible to the authenticated Admin subject."""
+
+        @application.router.route(
+            f"{self._prefix}/resources",
+            method="GET",
+            name="admin-resource-catalog",
+            roles=_READ,
+        )
+        async def list_resources(request: Request) -> Response:
+            """Return the explicit resource registry without repository data or row policies."""
+            del request
+            subject = _role_subject()
+            items = [
+                {
+                    "name": resource.name,
+                    "read_fields": list(resource.visible_read_fields(subject)),
+                }
+                for resource in self._resources.values()
+            ]
+            return _json_response({"items": items})
+
+    def _register_csrf_route(self, application: Application) -> None:
+        """Expose a no-store token endpoint only when browser writes are explicitly enabled."""
+        protector = self._csrf_protector
+        assert protector is not None
+
+        @application.router.route(
+            f"{self._prefix}/csrf-token",
+            method="GET",
+            name="admin-csrf-token",
+            roles=_WRITE,
+        )
+        async def issue_csrf_token(request: Request) -> Response:
+            """Return a short-lived token bound to this request's verified principal."""
+            del request
+            principal = current_principal()
+            if not isinstance(principal, Principal):
+                raise HTTPError(403, "security.csrf", "Authenticated Admin access is required.")
+            token = protector.issue(principal)
+            return Response.json(
+                {"token": token},
+                headers={"cache-control": "no-store", "pragma": "no-cache"},
+            )
+
+    def _register_write_capabilities_route(
+        self,
+        application: Application,
+        resources: tuple[AdminResource[Any, Any], ...],
+    ) -> None:
+        """Expose write allowlists only when authenticated browser writes are enabled."""
+
+        @application.router.route(
+            f"{self._prefix}/write-capabilities",
+            method="GET",
+            name="admin-write-capabilities",
+            roles=_WRITE,
+        )
+        async def list_write_capabilities(request: Request) -> Response:
+            """Return the explicitly configured write surface without inspecting repository data."""
+            del request
+            return _json_response(
+                {
+                    "items": [
+                        {
+                            "name": resource.name,
+                            "key_field": resource.key_field,
+                            "create_fields": sorted(resource.create_fields),
+                            "update_fields": sorted(resource.update_fields),
+                            "allow_delete": resource.allow_delete,
+                        }
+                        for resource in resources
+                    ]
+                }
+            )
+
+    def _write_authorized(self, request: Request) -> bool:
+        """Require a CSRF token for ambient browser credentials or explicit API authorization."""
+        headers = request.headers
+        if not isinstance(headers, Headers):
+            return False
+        origins = headers.getall("origin")
+        cookies = headers.getall("cookie")
+        if len(origins) > 1:
+            return False
+        if origins or cookies:
+            protector = self._csrf_protector
+            tokens = headers.getall("x-orbit-csrf-token")
+            if protector is None or len(tokens) != 1:
+                return False
+            principal = current_principal()
+            return isinstance(principal, Principal) and protector.verify(principal, tokens[0])
+        return has_explicit_non_browser_authorization(request)
 
     def _register_read_routes(
         self, application: Application, resource: AdminResource[Any, Any]
@@ -117,7 +280,10 @@ class AdminPlugin(Plugin):
                 raise HTTPError(400, "admin.query", "The limit parameter must appear once.")
             limit = _page_limit(values[0] if values else None)
             entities = await resource.repository.list(limit=limit)
-            return _json_response({"items": [resource.serialize(entity) for entity in entities]})
+            subject = _role_subject()
+            return _json_response(
+                {"items": [resource.serialize(entity, subject=subject) for entity in entities]}
+            )
 
         @application.router.route(
             item,
@@ -130,7 +296,7 @@ class AdminPlugin(Plugin):
             entity = await self._get(resource, _path_key(request))
             if entity is None:
                 raise HTTPError(404, "admin.not-found", "Resource was not found.")
-            return _json_response({"item": resource.serialize(entity)})
+            return _json_response({"item": resource.serialize(entity, subject=_role_subject())})
 
     def _register_write_routes(
         self, application: Application, resource: AdminResource[Any, Any]
@@ -147,10 +313,25 @@ class AdminPlugin(Plugin):
             )
             async def create_item(request: Request) -> Response:
                 """Validate allowed model fields, insert once, and record a payload-free audit."""
+                if not self._write_authorized(request):
+                    raise HTTPError(
+                        403, "security.csrf", "Explicit non-browser authorization required."
+                    )
                 values = _write_object(_json_write_body(request), resource.create_fields)
                 entity = resource.model.model_validate(values)
                 try:
-                    await resource.repository.add(entity)
+                    if self.delta_audit is None:
+                        await resource.repository.add(entity)
+                    else:
+                        handler = resource.delta_mutation_handler
+                        assert handler is not None
+                        snapshot = await handler("crud.create", None, entity)
+                        self._validate_snapshot(resource, snapshot)
+                        if snapshot.before is not None:
+                            raise RuntimeError("Create delta handler returned a before snapshot.")
+                        entity = snapshot.after
+                        if entity is None:
+                            raise RuntimeError("Create delta handler returned no after snapshot.")
                 except RepositoryConflictError:
                     await self.audit_log.record(
                         "crud.create",
@@ -161,8 +342,17 @@ class AdminPlugin(Plugin):
                     raise HTTPError(
                         409, "admin.conflict", "Resource conflicts with an existing item."
                     ) from None
-                await self.audit_log.record("crud.create", target=resource.name, success=True)
-                return _json_response({"item": resource.serialize(entity)}, status=201)
+                audit_target = resource.name
+                if self.delta_audit is not None:
+                    assert snapshot is not None
+                    delta_id = await self._record_delta(
+                        "crud.create", resource.name, snapshot.before, snapshot.after
+                    )
+                    audit_target = f"{resource.name}#delta={delta_id}"
+                await self.audit_log.record("crud.create", target=audit_target, success=True)
+                return _json_response(
+                    {"item": resource.serialize(entity, subject=_role_subject())}, status=201
+                )
 
         if resource.update_fields:
 
@@ -174,13 +364,32 @@ class AdminPlugin(Plugin):
             )
             async def update_item(request: Request) -> Response:
                 """Update only allowlisted fields while preserving the immutable resource key."""
+                if not self._write_authorized(request):
+                    raise HTTPError(
+                        403, "security.csrf", "Explicit non-browser authorization required."
+                    )
                 key = _path_key(request)
                 patch = _write_object(_json_write_body(request), resource.update_fields)
                 update_handler = resource.update_handler
-                if update_handler is None:
+                if self.delta_audit is None and update_handler is None:
                     raise RuntimeError("Resource update handler is missing after validation.")
                 try:
-                    entity = await update_handler(_parse_key(resource, key), patch)
+                    parsed_key = _parse_key(resource, key)
+                    if self.delta_audit is None:
+                        assert update_handler is not None
+                        entity = await update_handler(parsed_key, patch)
+                        snapshot = None
+                    else:
+                        handler = resource.delta_mutation_handler
+                        assert handler is not None
+                        snapshot = await handler("crud.update", parsed_key, patch)
+                        self._validate_snapshot(resource, snapshot)
+                        if snapshot.before is None:
+                            entity = None
+                        elif snapshot.after is None:
+                            raise RuntimeError("Update delta handler returned no after snapshot.")
+                        else:
+                            entity = snapshot.after
                 except RepositoryConflictError:
                     await self.audit_log.record(
                         "crud.update",
@@ -193,8 +402,15 @@ class AdminPlugin(Plugin):
                     ) from None
                 if entity is None:
                     raise HTTPError(404, "admin.not-found", "Resource was not found.")
-                await self.audit_log.record("crud.update", target=resource.name, success=True)
-                return _json_response({"item": resource.serialize(entity)})
+                audit_target = resource.name
+                if self.delta_audit is not None:
+                    assert snapshot is not None
+                    delta_id = await self._record_delta(
+                        "crud.update", resource.name, snapshot.before, snapshot.after
+                    )
+                    audit_target = f"{resource.name}#delta={delta_id}"
+                await self.audit_log.record("crud.update", target=audit_target, success=True)
+                return _json_response({"item": resource.serialize(entity, subject=_role_subject())})
 
         if resource.allow_delete:
 
@@ -206,16 +422,108 @@ class AdminPlugin(Plugin):
             )
             async def delete_item(request: Request) -> Response:
                 """Delete an existing resource and audit the outcome without storing its key."""
-                deleted = await resource.repository.delete(_parse_key(resource, _path_key(request)))
-                if not deleted:
-                    raise HTTPError(404, "admin.not-found", "Resource was not found.")
-                await self.audit_log.record("crud.delete", target=resource.name, success=True)
+                if not self._write_authorized(request):
+                    raise HTTPError(
+                        403, "security.csrf", "Explicit non-browser authorization required."
+                    )
+                parsed_key = _parse_key(resource, _path_key(request))
+                audit_target = resource.name
+                if self.delta_audit is None:
+                    deleted = await resource.repository.delete(parsed_key)
+                    if not deleted:
+                        raise HTTPError(404, "admin.not-found", "Resource was not found.")
+                    snapshot = None
+                else:
+                    handler = resource.delta_mutation_handler
+                    assert handler is not None
+                    snapshot = await handler("crud.delete", parsed_key, {})
+                    self._validate_snapshot(resource, snapshot)
+                    if snapshot.before is None and snapshot.after is None:
+                        raise HTTPError(404, "admin.not-found", "Resource was not found.")
+                    if snapshot.before is None or snapshot.after is not None:
+                        raise RuntimeError(
+                            "Delete delta handler returned invalid entity snapshots."
+                        )
+                    delta_id = await self._record_delta(
+                        "crud.delete", resource.name, snapshot.before, snapshot.after
+                    )
+                    audit_target = f"{resource.name}#delta={delta_id}"
+                await self.audit_log.record("crud.delete", target=audit_target, success=True)
                 return Response(status=204)
+
+    async def _review_resource_catalog(self, _: Mapping[str, object]) -> ControlResult:
+        """Report catalog size and endpoint prefix without reading protected records."""
+        writable = sum(
+            bool(resource.create_fields or resource.update_fields or resource.allow_delete)
+            for resource in self._resources.values()
+        )
+        return ControlResult(
+            "Admin resource catalog is configured.",
+            (
+                f"api_prefix: {self._prefix}",
+                f"resource_count: {len(self._resources)}",
+                f"resources_with_write_operations: {writable}",
+            ),
+        )
+
+    async def _review_operations_overview(self, _: Mapping[str, object]) -> ControlResult:
+        """Report local application state and service count without reading protected records."""
+        application = self._application
+        if application is None:
+            return ControlResult(
+                "Admin plugin is not composed into an application.", succeeded=False
+            )
+        return ControlResult(
+            "Admin operations overview is ready.",
+            (
+                f"application_state: {application.state.application.phase.value}",
+                f"registered_services: {len(application.services.descriptors)}",
+            ),
+        )
 
     @staticmethod
     async def _get(resource: AdminResource[Any, Any], raw_key: str) -> Any:
         """Parse the configured key type and read one entity from its repository."""
         return await resource.repository.get(_parse_key(resource, raw_key))
+
+    async def _record_delta(
+        self,
+        action: str,
+        target: str,
+        before: Any,
+        after: Any,
+    ) -> str:
+        """Persist a mutation delta and translate sink failures to a stable safe HTTP error."""
+        sink = self.delta_audit
+        assert sink is not None
+        try:
+            delta_id = await sink.record_change(action, target, before, after)
+        except Exception:
+            raise HTTPError(
+                503,
+                "admin.audit-unavailable",
+                "The mutation may have completed; verify resource state before retrying.",
+            ) from None
+        if not isinstance(delta_id, str) or _DELTA_IDENTIFIER.fullmatch(delta_id) is None:
+            raise HTTPError(
+                503,
+                "admin.audit-unavailable",
+                "The mutation may have completed; verify resource state before retrying.",
+            )
+        return delta_id
+
+    @staticmethod
+    def _validate_snapshot(resource: AdminResource[Any, Any], snapshot: object) -> None:
+        """Reject malformed handler snapshots before exposing or auditing them."""
+        from orbit_admin.resources import AdminMutationSnapshot
+
+        if not isinstance(snapshot, AdminMutationSnapshot):
+            raise TypeError("delta_mutation_handler must return AdminMutationSnapshot.")
+        if any(
+            entity is not None and not isinstance(entity, resource.model)
+            for entity in (snapshot.before, snapshot.after)
+        ):
+            raise TypeError("Mutation snapshots must contain the configured resource model.")
 
 
 def _path_key(request: Request) -> str:
@@ -224,6 +532,12 @@ def _path_key(request: Request) -> str:
     if not isinstance(key, str) or not 1 <= len(key) <= _MAX_KEY_CHARS:
         raise HTTPError(400, "admin.key", "Resource key is invalid.")
     return key
+
+
+def _role_subject() -> RoleSubject | None:
+    """Return only a structurally validated role subject from Core's request context."""
+    principal = current_principal()
+    return principal if isinstance(principal, RoleSubject) else None
 
 
 def _parse_key(resource: AdminResource[Any, Any], raw_key: str) -> Any:
@@ -267,8 +581,12 @@ def _json_write_body(request: Request) -> object:
 
 
 def _json_response(payload: object, *, status: int = 200) -> Response:
-    """Serialize one response and enforce the Admin package's independent byte ceiling."""
-    response = Response.json(payload, status=status)
+    """Serialize one uncached response under the Admin package's independent byte ceiling."""
+    response = Response.json(
+        payload,
+        status=status,
+        headers={"cache-control": "no-store", "pragma": "no-cache"},
+    )
     if len(response.body) > _MAX_RESPONSE_BYTES:
         raise HTTPError(413, "admin.response-too-large", "Admin response exceeds the 2 MiB limit.")
     return response

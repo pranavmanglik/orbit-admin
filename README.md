@@ -1,8 +1,9 @@
 # Orbit Admin
 
-`@orbit-projects/orbit-admin` is a small TypeScript operations dashboard for the authenticated,
-read-only inspection APIs already provided by Orbit Core. The browser package is installed and
-deployed separately; it does not add routes, credentials, dependencies, or a UI framework to Core.
+`@orbit-projects/orbit-admin` provides an authenticated TypeScript Admin dashboard and an optional
+Python plugin for operations and explicitly configured repository resources. The browser package
+is installed and deployed separately; it does not add routes, credentials, dependencies, or a UI
+framework to Orbit Core.
 
 ## Build the static dashboard
 
@@ -14,9 +15,9 @@ npm run build
 ```
 
 The deployable site is written to `dist/`. Serve it at a same-origin path such as `/orbit-admin/`
-and proxy `/admin/*` to the same Orbit Core application. Same-origin deployment avoids adding CORS
-or a cross-site credential path. The package makes only allowlisted GET requests to Core's JSON
-inspection endpoints and caps each response at 1 MiB by default.
+and proxy `/admin/*` and `/admin-api/v1/resources/*` to the same Orbit application. Same-origin
+deployment avoids adding CORS or a cross-site credential path. The package makes only allowlisted
+GET requests and caps each response at 1 MiB by default.
 
 Enable Core Admin explicitly with `ApplicationConfig(admin_enabled=True)` and configure an
 authenticator that grants `orbit.admin.read` only to approved operators. Core enables no default
@@ -34,24 +35,32 @@ content security policy.
 
 ## Current scope
 
-The dashboard provides application state, services, tasks, plugins, routes, dependencies,
-configuration, lifecycle, health, diagnostics, events, and administrative audit views. It is
-read-only. Core deliberately rejects browser-originated operational mutations unless a client
-provides explicit non-browser authorization, so the UI does not expose service controls. It is not
-a business-data CRUD framework, analytics warehouse, identity manager, or replacement for Core's
-server-rendered Admin fallback. Those capabilities need separate resource, authorization, audit,
-and data-exposure contracts before implementation.
+The dashboard provides Core operations views and tables for resources explicitly exposed by the
+Python plugin. It requests at most 100 records per resource and renders only server-returned fields
+as text. Browser create, edit, and delete controls appear only when the authenticated operator has
+the write role and the Python plugin has CSRF protection enabled; writes use explicit JSON
+field allowlists. The dashboard is not an identity manager or replacement for Core's server-rendered
+Admin fallback.
+
+When the Python plugin is registered, Orbit CLI provides **Review Admin resource catalog** and
+**Review Admin operations overview** actions. They show allowlisted resource counts, endpoint policy,
+and local service counts without fetching records, making HTTP requests, or exposing field values.
 
 This repository provides two independent packages: the TypeScript dashboard at the root and an
-optional Python plugin in `python/`. The Python package adds explicitly configured repository CRUD
-routes and depends directly on Core, `orbit-security`, `orbit-data`, and `orbit-sql`. Core still owns
-the transitional `/admin` operations API and authentication internals; their extraction remains
-open under ADR 0022. The Python package does not start a separate process or add a web framework,
-and supports an opt-in SQL audit sink with bounded retention.
+optional Python plugin in `python/`. The Python package owns the operations API and explicitly
+configured repository CRUD routes; it depends directly on Core, `orbit-auth`, `orbit-auth-rbac`,
+`orbit-security`, `orbit-data`, and `orbit-sql`. Core provides runtime composition and stable
+extension contracts. The Python package does not start a separate process or add a web framework,
+and supports field-level role/row-scope filtering, bounded SQL audit history, and opt-in encrypted
+state-diff audit objects through `orbit-storage`. Encrypted audit mode requires application-owned
+atomic mutation handlers and does not make an object-store write atomic with the resource database.
 
-Both packages are pre-alpha and have not been published. The Python CRUD package has local SQLite
-coverage for its SQL audit sink but no live SQL provider matrix or production load evidence. Browser compatibility,
-reverse-proxy behavior, and production authentication have not been exercised in this checkpoint.
+Both packages are unpublished v0.1.0-alpha review candidates. The Python package has local SQLite
+coverage for its SQL audit sink and AES-GCM tamper detection. Its CPython 3.11–3.14 tests, lint,
+formatting, strict type checks, package builds, and dependency audits pass locally; the dashboard
+typecheck, build, tests, and npm audit pass locally on Node.js 24.21.0. Hosted CI, live SQL provider coverage,
+transactional outbox integration, production browser/auth proxy review, external key management,
+object-retention validation, and production load evidence remain open release gates.
 
 ## Documentation
 
